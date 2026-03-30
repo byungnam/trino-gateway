@@ -14,6 +14,8 @@
 package io.trino.gateway.ha.router;
 
 import io.trino.gateway.ha.config.DataStoreConfiguration;
+import io.trino.gateway.ha.domain.TableData;
+import io.trino.gateway.ha.domain.request.QueryHistoryRequest;
 import io.trino.gateway.ha.domain.response.DistributionResponse;
 import io.trino.gateway.ha.persistence.FlywayMigration;
 import io.trino.gateway.ha.persistence.JdbcConnectionManager;
@@ -114,6 +116,59 @@ abstract class BaseTestQueryHistoryManager
         // Should return 1 entry
         resList = queryHistoryManager.findDistribution(currentTime);
         assertThat(resList).hasSize(1);
+    }
+
+    @Test
+    void testSqlInjectionInFindQueryHistory()
+    {
+        // Insert data for two different users
+        QueryHistoryManager.QueryDetail detail1 = new QueryHistoryManager.QueryDetail();
+        detail1.setBackendUrl("http://backend1:8080");
+        detail1.setSource("test-source");
+        detail1.setUser("alice");
+        detail1.setQueryText("select 1");
+        detail1.setQueryId("injection_test_1");
+        detail1.setCaptureTime(System.currentTimeMillis());
+        queryHistoryManager.submitQueryDetail(detail1);
+
+        QueryHistoryManager.QueryDetail detail2 = new QueryHistoryManager.QueryDetail();
+        detail2.setBackendUrl("http://backend2:8080");
+        detail2.setSource("test-source");
+        detail2.setUser("bob");
+        detail2.setQueryText("select 2");
+        detail2.setQueryId("injection_test_2");
+        detail2.setCaptureTime(System.currentTimeMillis());
+        queryHistoryManager.submitQueryDetail(detail2);
+
+        // Attempt SQL injection via externalUrl field to bypass user filter
+        QueryHistoryRequest injectionRequest = new QueryHistoryRequest(
+                1, 100, "alice", "' OR 1=1 AND '1'='1", null, null);
+        TableData<QueryHistoryManager.QueryDetail> result = queryHistoryManager.findQueryHistory(injectionRequest);
+
+        // Should only return alice's queries, not bob's — injection must not bypass user filter
+        assertThat(result.getRows().stream().allMatch(q -> "alice".equals(q.getUser()))).isTrue();
+
+        // The injected value should match no rows (no externalUrl equals that literal string)
+        assertThat(result.getRows()).isEmpty();
+
+        // Attempt SQL injection via source field
+        QueryHistoryRequest sourceInjection = new QueryHistoryRequest(
+                1, 100, "alice", null, null, "' OR '1'='1");
+        TableData<QueryHistoryManager.QueryDetail> sourceResult = queryHistoryManager.findQueryHistory(sourceInjection);
+        assertThat(sourceResult.getRows()).isEmpty();
+
+        // Attempt SQL injection via queryId field
+        QueryHistoryRequest queryIdInjection = new QueryHistoryRequest(
+                1, 100, "alice", null, "' OR '1'='1", null);
+        TableData<QueryHistoryManager.QueryDetail> queryIdResult = queryHistoryManager.findQueryHistory(queryIdInjection);
+        assertThat(queryIdResult.getRows()).isEmpty();
+
+        // Verify normal query still works
+        QueryHistoryRequest normalRequest = new QueryHistoryRequest(
+                1, 100, "alice", null, null, null);
+        TableData<QueryHistoryManager.QueryDetail> normalResult = queryHistoryManager.findQueryHistory(normalRequest);
+        assertThat(normalResult.getRows()).hasSize(1);
+        assertThat(normalResult.getRows().get(0).getUser()).isEqualTo("alice");
     }
 
     @Test
